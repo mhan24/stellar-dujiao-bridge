@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+*.sqlite3
+*.db
+*.tar.gz
+.venv/
+venv/
+bridge-venv/
+
