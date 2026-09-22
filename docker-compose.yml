@@ -1,0 +1,13 @@
+services:
+  stellar-dujiao-bridge:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8091:8080"
+    volumes:
+      - bridge-data:/data
+
+volumes:
+  bridge-data:
