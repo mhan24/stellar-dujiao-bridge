@@ -1,0 +1,12 @@
+[Unit]
+Description=Queue Dujiao price and inventory synchronization
+After=dujiao-next.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/opt/dujiao-next/minute-sync.env
+ExecStart=/opt/dujiao-next/dujiao-minute-sync
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true

@@ -1,0 +1,11 @@
+[Unit]
+Description=Synchronize Dujiao prices and inventory every minute
+
+[Timer]
+OnCalendar=*-*-* *:*:15
+AccuracySec=1s
+Persistent=true
+Unit=dujiao-minute-sync.service
+
+[Install]
+WantedBy=timers.target

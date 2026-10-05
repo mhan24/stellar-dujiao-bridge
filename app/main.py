@@ -35,9 +35,9 @@ DUJIAO_API_KEY = env("DUJIAO_API_KEY")
 DUJIAO_API_SECRET = env("DUJIAO_API_SECRET")
 DB_PATH = env("DB_PATH", "/data/bridge.db")
 SITE_NAME = env("SITE_NAME", "Stellar Wholesale eSIM")
-SYNC_INTERVAL_SECONDS = int(env("SYNC_INTERVAL_SECONDS", "900"))
+SYNC_INTERVAL_SECONDS = int(env("SYNC_INTERVAL_SECONDS", "60"))
 HTTP_TIMEOUT_SECONDS = float(env("HTTP_TIMEOUT_SECONDS", "30"))
-STELLAR_PAGINATION_DELAY_SECONDS = float(env("STELLAR_PAGINATION_DELAY_SECONDS", "1.1"))
+STELLAR_PAGINATION_DELAY_SECONDS = float(env("STELLAR_PAGINATION_DELAY_SECONDS", "1.5"))
 TOP_PLAN_LIMIT = int(env("TOP_PLAN_LIMIT", "5"))
 WALLET_CACHE_SECONDS = float(env("WALLET_CACHE_SECONDS", "30"))
 PRODUCT_BUNDLE_ID = 900000001
@@ -70,6 +70,7 @@ def init_db() -> None:
     with db_connect() as db:
         db.executescript(
             """
+            CREATE TABLE IF NOT EXISTS bridge_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS plans (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 stellar_plan_id TEXT NOT NULL UNIQUE,
@@ -123,6 +124,10 @@ def init_db() -> None:
             );
             """
         )
+        columns = {row[1] for row in db.execute("PRAGMA table_info(plans)")}
+        if "published" not in columns:
+            db.execute("ALTER TABLE plans ADD COLUMN published INTEGER NOT NULL DEFAULT 0")
+            db.execute("UPDATE plans SET published = 1 WHERE available = 1")
 
 
 class StellarError(Exception):
@@ -191,7 +196,7 @@ class StellarClient:
         return await self.request("GET", "/wallet")
 
     async def list_plans(self, page: int = 1, per_page: int = 100) -> dict[str, Any]:
-        return await self.request("GET", "/plans", params={"page": page, "per_page": per_page})
+        return await self.request("GET", "/plans", params={"page": page, "per_page": per_page, "country_code": "CN"})
 
     async def create_order(
         self, plan_id: str, quantity: int, days: int | None, idempotency_key: str
@@ -217,6 +222,8 @@ stellar = StellarClient()
 worker_task: asyncio.Task[None] | None = None
 wallet_lock = asyncio.Lock()
 order_create_lock = asyncio.Lock()
+catalogue_lock = asyncio.Lock()
+catalogue_last_attempt = 0.0
 wallet_cache: dict[str, Any] = {
     "available_balance": None,
     "currency": "",
@@ -361,9 +368,24 @@ def reserved_wholesale_cost() -> Decimal:
     return total
 
 
+def catalogue_is_fresh() -> bool:
+    with db_connect() as db:
+        row = db.execute("SELECT value FROM bridge_state WHERE key='catalogue_synced_at'").fetchone()
+    return bool(row) and (now() - parse_iso(row[0])).total_seconds() <= max(2 * SYNC_INTERVAL_SECONDS + 120, 300)
+
+
+async def product_wallet_snapshot() -> dict[str, Any]:
+    try:
+        return await asyncio.wait_for(wallet_snapshot(), timeout=5)
+    except TimeoutError:
+        return {"available_balance": None, "currency": "", "error": "wallet_timeout"}
+
+
 def wallet_capacity_for_plan(
     plan: dict[str, Any], wallet: dict[str, Any], reserved_cost: Decimal
 ) -> int:
+    if not plan.get("available") or not catalogue_is_fresh():
+        return 0
     balance = wallet.get("available_balance")
     if not isinstance(balance, Decimal):
         return 0
@@ -408,7 +430,7 @@ def is_mainland_china_plan(raw: dict[str, Any]) -> bool:
     codes = {str(code).upper() for code in (coverage.get("codes") or []) if code}
     if codes:
         return codes == {"CN"}
-    return str(raw.get("country_code") or "").upper() == "CN"
+    return False
 
 
 def plan_price_per_gb(raw: dict[str, Any]) -> Decimal:
@@ -424,19 +446,29 @@ def plan_price_per_gb(raw: dict[str, Any]) -> Decimal:
 
 
 def best_mainland_plan_ids(plans: list[dict[str, Any]]) -> set[str]:
-    """Keep the cheapest mainland-China plans by price per GB."""
+    """Keep the cheapest available mainland-China plans by price per GB."""
     candidates = [
         plan
         for plan in plans
-        if plan.get("available", False) and is_mainland_china_plan(plan)
+        if plan.get("available", False)
+        and is_mainland_china_plan(plan)
+        and str((plan.get("price") or {}).get("currency") or "EUR").upper() == "EUR"
+        and plan_price_per_gb(plan).is_finite()
     ]
     # Python's sort is stable, so equal price/GB plans retain Stellar's order.
     candidates.sort(key=plan_price_per_gb)
-    return {
-        str(plan.get("id"))
-        for plan in candidates[: max(0, TOP_PLAN_LIMIT)]
-        if plan.get("id")
-    }
+    unique: list[dict[str, Any]] = []
+    seen_specs: set[tuple[Decimal, int | None]] = set()
+    for plan in candidates:
+        if not plan.get("id"):
+            continue
+        spec = (Decimal(str(plan["data"]["megabytes"])), plan_duration_days(plan))
+        if spec in seen_specs:
+            continue
+        seen_specs.add(spec)
+        unique.append(plan)
+    selected = unique[:TOP_PLAN_LIMIT] if TOP_PLAN_LIMIT > 0 else unique
+    return {str(plan["id"]) for plan in selected}
 
 
 def upsert_plans(plans: list[dict[str, Any]]) -> None:
@@ -499,16 +531,35 @@ def upsert_plans(plans: list[dict[str, Any]]) -> None:
                     json.dumps(raw, ensure_ascii=False),
                 ),
             )
+        db.execute("UPDATE plans SET published = 1 WHERE available = 1")
         if seen_ids:
             placeholders = ",".join("?" for _ in seen_ids)
             db.execute(
                 f"UPDATE plans SET available = 0 WHERE stellar_plan_id NOT IN ({placeholders})",
                 tuple(seen_ids),
             )
+        else:
+            db.execute("UPDATE plans SET available = 0")
         db.commit()
 
 
 async def sync_catalogue() -> int:
+    """Coalesce catalogue events and keep them within the periodic sync budget."""
+    global catalogue_last_attempt
+    if catalogue_lock.locked():
+        return 0
+    async with catalogue_lock:
+        if catalogue_last_attempt and time.monotonic() - catalogue_last_attempt < SYNC_INTERVAL_SECONDS:
+            return 0
+        catalogue_last_attempt = time.monotonic()
+        try:
+            return await fetch_catalogue()
+        except Exception:
+            log.exception("catalogue sync failed; retry on next interval")
+            return 0
+
+
+async def fetch_catalogue() -> int:
     all_plans: list[dict[str, Any]] = []
     page = 1
     while True:
@@ -522,9 +573,11 @@ async def sync_catalogue() -> int:
             break
         page += 1
     upsert_plans(all_plans)
+    with db_connect() as db:
+        db.execute("INSERT OR REPLACE INTO bridge_state(key,value) VALUES ('catalogue_synced_at',?)", (iso(),))
     best_ids = best_mainland_plan_ids(all_plans)
     log.info(
-        "catalogue sync complete: %s plans; best mainland China plans: %s",
+        "catalogue sync complete (country_code=CN): %s plans; best mainland China plans: %s",
         len(all_plans),
         len(best_ids),
     )
@@ -569,15 +622,15 @@ def product_from_plan(plan: dict[str, Any], stock_quantity: int | None = None) -
     content = {
         "zh-CN": (
             f"<p>{description}</p>"
-            "<p>共 5 个 SKU，按价格/GB 从低到高排序，请选择对应流量和有效期。</p>"
+            "<p>按套餐总价从低到高排序，请选择对应流量和有效期。</p>"
         ),
         "zh-TW": (
             f"<p>{description}</p>"
-            "<p>共 5 個 SKU，按價格/GB 從低到高排序，請選擇對應流量和有效期。</p>"
+            "<p>按套餐總價從低到高排序，請選擇對應流量和有效期。</p>"
         ),
         "en-US": (
             f"<p>{description}</p>"
-            "<p>Five SKUs are sorted from lowest to highest price per GB. Select the data and validity you need.</p>"
+            "<p>SKUs are sorted from lowest to highest total price. Select the data and validity you need.</p>"
         ),
     }
     if stock_quantity is None:
@@ -619,9 +672,9 @@ def product_from_plan(plan: dict[str, Any], stock_quantity: int | None = None) -
 
 def available_plan_rows(limit: int | None = None) -> list[dict[str, Any]]:
     with db_connect() as db:
-        rows = [dict(row) for row in db.execute("SELECT * FROM plans WHERE available = 1").fetchall()]
-    rows.sort(key=lambda plan: plan_price_per_gb(json_load(plan["raw_json"], {})))
-    return rows[:limit] if limit is not None else rows
+        rows = [dict(row) for row in db.execute("SELECT * FROM plans WHERE available = 1 OR published = 1").fetchall()]
+    rows.sort(key=lambda plan: Decimal(product_price(json_load(plan["raw_json"], {}))))
+    return rows
 
 
 def product_bundle(
@@ -651,12 +704,12 @@ def product_bundle(
         },
         "description": {
             "zh-CN": "按价格/GB筛选的中国大陆 eSIM 套餐，请在 SKU 中选择流量和有效期。",
-            "en": "China mainland eSIM plans ranked by price per GB. Select a data and validity SKU.",
+            "en": "China mainland eSIM plans selected by price per GB and sorted by total price. Select a data and validity SKU.",
         },
         "content": {
-            "zh-CN": "<p>5 个 SKU，按价格/GB 从低到高排序，请选择对应流量和有效期。</p>",
-            "zh-TW": "<p>5 個 SKU，按價格/GB 從低到高排序，請選擇對應流量和有效期。</p>",
-            "en-US": "<p>Five SKUs sorted from lowest to highest price per GB. Select the data and validity you need.</p>",
+            "zh-CN": f"<p>{len(skus)} 个 SKU，按套餐总价从低到高排序，请选择对应流量和有效期。</p>",
+            "zh-TW": f"<p>{len(skus)} 個 SKU，按套餐總價從低到高排序，請選擇對應流量和有效期。</p>",
+            "en-US": f"<p>{len(skus)} SKUs sorted from lowest to highest total price. Select the data and validity you need.</p>",
         },
         "seo_meta": {},
         "images": [],
@@ -667,7 +720,7 @@ def product_bundle(
         "currency": plans[0]["currency"],
         "fulfillment_type": "auto",
         "manual_form_schema": None,
-        "is_active": True,
+        "is_active": any(bool(plan["available"]) for plan in plans),
         "category_id": 1,
         "skus": skus,
         "created_at": min(str(plan["updated_at"] or "") for plan in plans),
@@ -891,11 +944,8 @@ async def worker_loop() -> None:
         try:
             if time.time() - last_sync >= SYNC_INTERVAL_SECONDS:
                 last_sync = time.time()
-                try:
-                    await sync_catalogue()
-                    await wallet_snapshot(force=True)
-                except Exception:
-                    log.exception("periodic catalogue sync failed")
+                # Catalogue pagination must not block order fulfillment polling.
+                asyncio.create_task(sync_catalogue())
             with db_connect() as db:
                 rows = db.execute(
                     "SELECT id FROM orders WHERE status NOT IN ('delivered','failed','canceled') "
@@ -926,11 +976,8 @@ async def startup() -> None:
         log.warning("STELLAR_API_KEY is not configured")
     if not STELLAR_WEBHOOK_SECRET:
         log.warning("STELLAR_WEBHOOK_SECRET is not configured; webhook verification will fail")
-    try:
-        await sync_catalogue()
-        await wallet_snapshot(force=True)
-    except Exception:
-        log.exception("initial catalogue sync failed; worker will retry")
+    # Serve cached catalogue immediately; stale data has zero sellable stock.
+    asyncio.create_task(sync_catalogue())
     worker_task = asyncio.create_task(worker_loop())
 
 
@@ -986,17 +1033,19 @@ async def categories() -> dict[str, Any]:
 
 
 @app.get("/api/v1/upstream/products", dependencies=[Depends(require_dujiao)])
-async def products(page: int = 1, page_size: int = 20) -> dict[str, Any]:
+async def products(page: int = 1, page_size: int = 20, include_inactive: bool = False) -> dict[str, Any]:
     page = max(1, page)
     page_size = min(100, max(1, page_size))
     plans = available_plan_rows(limit=TOP_PLAN_LIMIT)
-    wallet = await wallet_snapshot()
+    wallet = await product_wallet_snapshot()
     reserved_cost = reserved_wholesale_cost()
-    bundle = product_bundle(plans, wallet, reserved_cost) if plans and page == 1 else None
+    visible = bool(plans) and (include_inactive or any(bool(plan["available"]) for plan in plans))
+    bundle = product_bundle(plans, wallet, reserved_cost) if visible and page == 1 else None
     return {
         "ok": True,
         "items": [bundle] if bundle else [],
-        "total": 1 if plans else 0,
+        "total": 1 if visible else 0,
+        "includes_inactive": include_inactive,
         "page": page,
         "page_size": page_size,
     }
@@ -1007,7 +1056,7 @@ async def product(product_id: int) -> dict[str, Any]:
     if product_id == PRODUCT_BUNDLE_ID:
         plans = available_plan_rows(limit=TOP_PLAN_LIMIT)
         if plans:
-            wallet = await wallet_snapshot()
+            wallet = await product_wallet_snapshot()
             return {
                 "ok": True,
                 "product": product_bundle(plans, wallet, reserved_wholesale_cost()),
@@ -1022,7 +1071,7 @@ async def product(product_id: int) -> dict[str, Any]:
             status_code=404,
             content={"ok": False, "error_code": "product_not_found", "error_message": "product not found"},
         )
-    wallet = await wallet_snapshot()
+    wallet = await product_wallet_snapshot()
     stock_quantity = wallet_capacity_for_plan(plan, wallet, reserved_wholesale_cost())
     return {"ok": True, "product": product_from_plan(plan, stock_quantity)}
 
