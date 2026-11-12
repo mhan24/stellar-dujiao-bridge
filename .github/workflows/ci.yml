@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e ".[dev]"
+      - name: Locked requirements match pyproject.toml
+        run: |
+          pip install uv
+          uv pip compile pyproject.toml -o /tmp/requirements.txt --python-version 3.12 --universal --no-header --quiet
+          diff -u requirements.txt /tmp/requirements.txt
+      - name: Lint
+        run: |
+          ruff check .
+          ruff format --check .
+      - name: Type check
+        run: mypy
+      - name: Test
+        run: python -m unittest discover -s tests -v
+
+  go-tools:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ops/minute-sync
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ops/minute-sync/go.mod
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t stellar-dujiao-bridge:ci .
+      - name: Container starts, serves /health and runs unprivileged
+        run: |
+          docker run -d --name bridge -e DB_PATH=/tmp/bridge.db -p 8080:8080 stellar-dujiao-bridge:ci
+          for attempt in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8080/health && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8080/health
+          test "$(docker exec bridge id -u)" = "10001"
+          docker logs bridge | tail -20
+          docker rm -f bridge

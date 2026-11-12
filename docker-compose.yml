@@ -2,12 +2,22 @@ services:
   stellar-dujiao-bridge:
     build: .
     restart: unless-stopped
+    # Reap zombies and forward SIGTERM so lifespan shutdown can finish cleanly.
+    init: true
+    stop_grace_period: 30s
     env_file:
       - .env
     ports:
       - "127.0.0.1:8091:8080"
     volumes:
       - bridge-data:/data
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
 volumes:
   bridge-data:

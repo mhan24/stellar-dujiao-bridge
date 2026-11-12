@@ -1,5 +1,16 @@
 .env
+.env.*
+.git/
+.github/
+.venv/
+.venv*/
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
 *.db
+*.db-*
+*.sqlite3
 tests/
+ops/
+price-notice-*

@@ -13,6 +13,7 @@ __pycache__/
 .venv/
 venv/
 bridge-venv/
+.venv312/
 
 
 # SQLite journals/backups and locally built deployment artifacts
@@ -22,3 +23,14 @@ bridge-venv/
 *.sqlite3-*
 ops/minute-sync/*.env
 ops/minute-sync/dujiao-minute-sync
+ops/minute-sync/minute-sync
+
+# Local virtualenvs for other Python versions (uv/venv) and build output
+.venv-*/
+build/
+dist/
+*.egg-info/
+
+# One-off upstream price notices produced during planning/incident work
+price-notice-*.csv
+price-notice-*.json
