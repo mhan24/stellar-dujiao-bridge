@@ -10,14 +10,16 @@ class SecurityTests(unittest.TestCase):
         body = b'{"sku_id":1}'
         timestamp = int(time.time())
         signature = dujiao_signature(secret, "POST", "/api/v1/upstream/orders", timestamp, body)
-        self.assertTrue(verify_dujiao_signature(
-            secret,
-            "POST",
-            "/api/v1/upstream/orders",
-            str(timestamp),
-            signature,
-            body,
-        ))
+        self.assertTrue(
+            verify_dujiao_signature(
+                secret,
+                "POST",
+                "/api/v1/upstream/orders",
+                str(timestamp),
+                signature,
+                body,
+            )
+        )
 
     def test_stellar_signature_round_trip(self):
         secret = "whsec_test"
