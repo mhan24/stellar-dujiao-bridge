@@ -12,11 +12,10 @@ Dujiao-Next ── HMAC API ──> Bridge ── Bearer API ──> Stellar Who
 
 ## 项目结构
 
-服务按职责拆分为小模块，`app/main.py` 只做入口和兼容性再导出（`uvicorn app.main:app`）。模块之间的调用一律写成 `模块.函数`，因此测试与排查时的 `patch` 目标就是定义该名字的模块。
+服务按职责拆分为小模块，ASGI 入口是 `app/api.py`（`uvicorn app.api:app`），没有额外的入口转发层。模块之间的调用一律写成 `模块.函数`，因此测试与排查时的 `patch` 目标就是定义该名字的模块。
 
 | 文件 | 职责 |
 |---|---|
-| `app/main.py` | 入口模块：再导出公开接口，保持 `app.main:app` 与旧导入路径可用 |
 | `app/api.py` | FastAPI 应用、Dujiao 鉴权、HTTP 路由、请求体上限、生命周期与后台任务登记 |
 | `app/settings.py` | 环境变量解析与启动校验，集中全部可调参数 |
 | `app/util.py` | 时间／JSON 辅助、SQLite 连接、建表与迁移 |
@@ -231,7 +230,7 @@ docker compose run --rm --user root --entrypoint chown stellar-dujiao-bridge -R 
 docker compose exec -T stellar-dujiao-bridge python - <<'PY'
 import sqlite3
 from datetime import datetime, timezone
-from app.main import DB_PATH
+from app.settings import DB_PATH
 backup = DB_PATH + '.backup-' + datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
 with sqlite3.connect(DB_PATH) as source, sqlite3.connect(backup) as target:
     source.backup(target)

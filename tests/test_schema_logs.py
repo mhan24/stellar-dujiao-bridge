@@ -8,7 +8,7 @@ from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from app import main as bridge
+from app import catalogue, logs, presentation, queues, settings, util
 
 LEGACY_SCHEMA = """
     CREATE TABLE bridge_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -51,12 +51,12 @@ class SchemaMigrationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        patcher = patch.object(bridge.settings, "DB_PATH", str(Path(self.tmp.name) / "legacy.db"))
+        patcher = patch.object(settings, "DB_PATH", str(Path(self.tmp.name) / "legacy.db"))
         patcher.start()
         self.addCleanup(patcher.stop)
 
     def create_legacy_database(self):
-        with bridge.db_connect() as db:
+        with util.db_connect() as db:
             db.executescript(LEGACY_SCHEMA)
             db.execute(
                 "INSERT INTO plans (stellar_plan_id,sku_code,name,slug,destination,country_code,"
@@ -72,10 +72,10 @@ class SchemaMigrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_legacy_database_is_upgraded_in_place(self):
         self.create_legacy_database()
-        with bridge.db_connect() as db:
+        with util.db_connect() as db:
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 0)
-        bridge.init_db()
-        with bridge.db_connect() as db:
+        util.init_db()
+        with util.db_connect() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
             plan_columns = {row[1] for row in db.execute("PRAGMA table_info(plans)")}
             order_columns = {row[1] for row in db.execute("PRAGMA table_info(orders)")}
@@ -86,38 +86,38 @@ class SchemaMigrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(db.execute("SELECT purchase_attempted FROM orders").fetchone()[0], 1)
             self.assertEqual(db.execute("SELECT published FROM plans").fetchone()[0], 1)
             self.assertEqual(db.execute("SELECT upstream_active FROM plans").fetchone()[0], 1)
-        self.assertEqual(version, len(bridge.util.MIGRATIONS))
+        self.assertEqual(version, len(util.MIGRATIONS))
         self.assertTrue({"published", "upstream_active"} <= plan_columns)
         self.assertTrue({"unit_cost", "cancel_results_json", "refunded_amount"} <= order_columns)
         self.assertIn("failed_at", event_columns)
         self.assertIn("failed_at", outbox_columns)
         self.assertIn("idx_orders_poll", indexes)
         # A second startup is a no-op.
-        bridge.init_db()
-        with bridge.db_connect() as db:
+        util.init_db()
+        with util.db_connect() as db:
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], version)
 
     async def test_partially_migrated_database_still_starts(self):
         """A database that already has some new columns must not fail on ALTER."""
         self.create_legacy_database()
-        with bridge.db_connect() as db:
+        with util.db_connect() as db:
             db.execute("ALTER TABLE plans ADD COLUMN published INTEGER NOT NULL DEFAULT 0")
             db.execute("ALTER TABLE orders ADD COLUMN unit_cost TEXT")
-        bridge.init_db()
-        with bridge.db_connect() as db:
+        util.init_db()
+        with util.db_connect() as db:
             columns = {row[1] for row in db.execute("PRAGMA table_info(orders)")}
         self.assertIn("refunded_amount", columns)
 
     async def test_delivery_payloads_expire_only_when_configured(self):
-        bridge.init_db()
-        bridge.upsert_plans([RAW_PLAN])
-        plan = bridge.available_plan_rows()[0]
+        util.init_db()
+        catalogue.upsert_plans([RAW_PLAN])
+        plan = presentation.available_plan_rows()[0]
         payload = json.dumps({"delivery_data": {"esims": [{"sim_id": "SIM-1", "customer_link": "https://x"}]}})
-        old = bridge.iso(bridge.now() - timedelta(days=400))
-        with bridge.db_connect() as db:
+        old = util.iso(util.now() - timedelta(days=400))
+        with util.db_connect() as db:
             for suffix, status, updated in (
                 ("old", "delivered", old),
-                ("new", "delivered", bridge.iso()),
+                ("new", "delivered", util.iso()),
                 ("live", "fulfilling", old),
             ):
                 db.execute(
@@ -125,11 +125,11 @@ class SchemaMigrationTests(unittest.IsolatedAsyncioTestCase):
                     "created_at,updated_at,fulfillment_json) VALUES (?,?,?,?,?,?,?,?,?)",
                     (f"ord-{suffix}", plan["id"], 1, f"k-{suffix}", status, "EUR", updated, updated, payload),
                 )
-        with patch.object(bridge.settings, "FULFILLMENT_RETENTION_DAYS", 0):
-            self.assertEqual(bridge.prune_durable_queues()[2], 0)
-        with patch.object(bridge.settings, "FULFILLMENT_RETENTION_DAYS", 90):
-            self.assertEqual(bridge.prune_durable_queues()[2], 1)
-        with bridge.db_connect() as db:
+        with patch.object(settings, "FULFILLMENT_RETENTION_DAYS", 0):
+            self.assertEqual(queues.prune_durable_queues()[2], 0)
+        with patch.object(settings, "FULFILLMENT_RETENTION_DAYS", 90):
+            self.assertEqual(queues.prune_durable_queues()[2], 1)
+        with util.db_connect() as db:
             kept = {row[0] for row in db.execute("SELECT order_no FROM orders WHERE fulfillment_json IS NOT NULL")}
         self.assertEqual(kept, {"ord-new", "ord-live"})
 
@@ -146,7 +146,7 @@ class LoggingTests(unittest.TestCase):
             None,
         )
         record.order_id, record.to_status = 7, "fulfilling"
-        payload = json.loads(bridge.logs.JsonFormatter().format(record))
+        payload = json.loads(logs.JsonFormatter().format(record))
         self.assertEqual(payload["message"], "order 7: creating -> fulfilling")
         self.assertEqual(payload["level"], "INFO")
         self.assertEqual(payload["order_id"], 7)
@@ -162,7 +162,7 @@ class LoggingTests(unittest.TestCase):
             record = logging.LogRecord(
                 "stellar-dujiao-bridge", logging.ERROR, __file__, 1, "failed", None, sys.exc_info()
             )
-        payload = json.loads(bridge.logs.JsonFormatter().format(record))
+        payload = json.loads(logs.JsonFormatter().format(record))
         self.assertIn("RuntimeError: boom", payload["exception"])
 
 
