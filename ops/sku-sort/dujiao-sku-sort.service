@@ -1,0 +1,13 @@
+[Unit]
+Description=Maintain Dujiao eSIM SKU order by ascending retail price
+After=dujiao-next.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/opt/dujiao-next/sku-sort.env
+ExecStart=/usr/bin/python3 /opt/dujiao-next/sort_skus.py
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/dujiao-next/db
+ProtectHome=true
+PrivateTmp=true
