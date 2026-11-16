@@ -82,16 +82,14 @@ QUEUE_PRUNE_INTERVAL_SECONDS = _int("QUEUE_PRUNE_INTERVAL_SECONDS", "3600")
 ESIM_EVENT_SWEEP_LIMIT = _int("ESIM_EVENT_SWEEP_LIMIT", "20")
 ESIM_EVENT_SWEEP_COOLDOWN_SECONDS = _float("ESIM_EVENT_SWEEP_COOLDOWN_SECONDS", "5")
 
-# Product selection model (portfolio-v1)
+# Product selection model (portfolio-v2)
 PRODUCT_BUNDLE_ID = 900000001
 TOP_PLAN_LIMIT = _int("TOP_PLAN_LIMIT", "10")
-PLAN_UPGRADE_PRICE_TOLERANCE = _decimal("PLAN_UPGRADE_PRICE_TOLERANCE", "0.01")
-PLAN_SELECTION_MODEL = "portfolio-v1"
-PLAN_SELECTION_PRICE_BAND = Decimal("0.05")
-PLAN_SELECTION_TIME_WEIGHT = Decimal("0.15")
+PLAN_SELECTION_MODEL = "portfolio-v2"
+PLAN_SELECTION_SMALL_GB = 3
+PLAN_SELECTION_LARGE_GB = 30
 PLAN_SELECTION_SHORT_DAYS = 7
 PLAN_SELECTION_LONG_DAYS = 30
-PLAN_SELECTION_TIME_CAP_DAYS = 90
 
 
 def validate() -> list[str]:
@@ -121,8 +119,6 @@ def validate() -> list[str]:
         warnings.append("TOP_PLAN_LIMIT is negative; every qualifying plan will be published")
     if not 0 <= CATALOGUE_MIN_ACTIVE_RATIO <= 1:
         raise RuntimeError("CATALOGUE_MIN_ACTIVE_RATIO must be between 0 and 1")
-    if PLAN_UPGRADE_PRICE_TOLERANCE < 0:
-        raise RuntimeError("PLAN_UPGRADE_PRICE_TOLERANCE must not be negative")
     if LOG_FORMAT not in {"text", "json"}:
         raise RuntimeError(f"LOG_FORMAT must be 'text' or 'json', got {LOG_FORMAT!r}")
     if LOG_LEVEL.upper() not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:

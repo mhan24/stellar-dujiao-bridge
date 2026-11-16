@@ -131,8 +131,8 @@ def plan_route_label(raw: dict[str, Any], language: str = "zh-CN") -> str:
 
 
 def is_mainland_china_plan(raw: dict[str, Any]) -> bool:
-    """Keep the exact China destination with CN-only coverage."""
-    if str(raw.get("destination") or "").strip().casefold() != "china":
+    """Keep mainland roaming plans from either China destination with CN-only coverage."""
+    if str(raw.get("destination") or "").strip().casefold() not in {"china", "china mainland"}:
         return False
     coverage = raw.get("coverage") or {}
     codes = {str(code).upper() for code in (coverage.get("codes") or []) if code}
@@ -154,7 +154,7 @@ def plan_price_per_gb(raw: dict[str, Any]) -> Decimal:
 
 
 def best_mainland_plan_ids(plans: list[dict[str, Any]], spendable_balance: Decimal | None = None) -> set[str]:
-    """Fixed portfolio: low unit cost, bounded validity bonus, and route/time coverage."""
+    """Rank by unit cost, then total price, with allowance, validity and route coverage."""
     candidates = [
         plan
         for plan in plans
@@ -175,17 +175,6 @@ def best_mainland_plan_ids(plans: list[dict[str, Any]], spendable_balance: Decim
             str(plan.get("sku") or ""),
             str(plan["id"]),
         )
-
-    def value_key(plan: dict[str, Any]) -> tuple:
-        days = min(max(plan_duration_days(plan) or 0, 0), settings.PLAN_SELECTION_TIME_CAP_DAYS)
-        bonus = 1 + settings.PLAN_SELECTION_TIME_WEIGHT * Decimal(days) / settings.PLAN_SELECTION_TIME_CAP_DAYS
-        return (plan_price_per_gb(plan) / bonus, *stable_key(plan))
-
-    def choose(pool: list[dict[str, Any]], cheap: bool = False) -> dict[str, Any]:
-        # A candidate outside the 5% band cannot win by having a long validity.
-        metric = (lambda p: Decimal(product_price(p))) if cheap else plan_price_per_gb
-        floor = min(metric(p) for p in pool)
-        return min((p for p in pool if metric(p) <= floor * (1 + settings.PLAN_SELECTION_PRICE_BAND)), key=value_key)
 
     candidates.sort(key=stable_key)
 
@@ -219,8 +208,7 @@ def best_mainland_plan_ids(plans: list[dict[str, Any]], spendable_balance: Decim
         seen_specs.add(spec)
         unique.append(plan)
 
-    # Prefer a strictly better allowance/validity within a small price premium.
-    # Only compare equivalent network and service conditions, within the wallet budget.
+    # Only remove an option when equivalent service offers more for no higher total price.
     def dominated(plan: dict[str, Any]) -> bool:
         days = plan_duration_days(plan)
         if days is None:
@@ -238,7 +226,7 @@ def best_mainland_plan_ids(plans: list[dict[str, Any]], spendable_balance: Decim
             if (
                 other_size >= size
                 and other_days >= days
-                and other_price <= price * (1 + max(Decimal(0), settings.PLAN_UPGRADE_PRICE_TOLERANCE))
+                and other_price <= price
                 and (other_size > size or other_days > days)
             ):
                 return True
@@ -259,33 +247,25 @@ def best_mainland_plan_ids(plans: list[dict[str, Any]], spendable_balance: Decim
     def route_group(plan: dict[str, Any]) -> str:
         return "HK" if plan_route_label(plan) == "香港" else "NON_HK"
 
-    # Reserve only four slots; the other six remain available for lowest unit cost.
-    # Short anchors deliberately survive dominance by a longer near-price package.
-    for long_term in (False, True):
-        for group in ("HK", "NON_HK"):
-            pool = [
-                p
-                for p in unique
-                if route_group(p) == group
-                and (
-                    (plan_duration_days(p) or 0) >= settings.PLAN_SELECTION_LONG_DAYS
-                    if long_term
-                    else 0 < (plan_duration_days(p) or 0) <= settings.PLAN_SELECTION_SHORT_DAYS
-                )
-            ]
-            if pool:
-                add(choose(pool, cheap=not long_term))
-    # If a route has no short/long option, still retain that route when available.
+    if efficient:
+        add(efficient[0])
+    # One plan can cover several needs. Preserve a small/short option even if dominated.
+    coverage_pools = [
+        [p for p in unique if Decimal(str(p["data"]["megabytes"])) <= settings.PLAN_SELECTION_SMALL_GB * 1024],
+        [p for p in unique if 0 < (plan_duration_days(p) or 0) <= settings.PLAN_SELECTION_SHORT_DAYS],
+        [p for p in unique if Decimal(str(p["data"]["megabytes"])) >= settings.PLAN_SELECTION_LARGE_GB * 1024],
+        [p for p in unique if (plan_duration_days(p) or 0) >= settings.PLAN_SELECTION_LONG_DAYS],
+    ]
+    for pool in coverage_pools:
+        if pool and not any(str(p["id"]) in selected_ids for p in pool):
+            add(pool[0])
     for group in ("HK", "NON_HK"):
         if not any(route_group(p) == group for p in selected):
             pool = [p for p in efficient if route_group(p) == group]
             if pool:
-                add(choose(pool))
-    pool = [p for p in efficient if str(p["id"]) not in selected_ids]
-    while pool and len(selected) < settings.TOP_PLAN_LIMIT:
-        winner = choose(pool)
-        add(winner)
-        pool = [p for p in pool if str(p["id"]) not in selected_ids]
+                add(pool[0])
+    for plan in efficient:
+        add(plan)
     return {str(plan["id"]) for plan in selected}
 
 

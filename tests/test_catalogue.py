@@ -23,31 +23,45 @@ class CatalogueLifecycleTests(unittest.TestCase):
             "price": {"amount": str(price), "currency": "EUR"},
         }
 
-    def test_fixed_portfolio_reserves_both_routes_and_short_long_options(self):
+    def test_portfolio_covers_allowances_validities_and_routes_with_ten_skus(self):
         make = self.portfolio_plan
         anchors = [
-            make("hk-short", 1, 7, ".51", "HK"),
-            make("sg-short", 1, 7, ".51"),
-            make("hk-long", 50, 30, "14.22", "HK"),
-            make("sg-long", 50, 30, "14.22"),
+            make("best", 20, 20, "4.00", "HK"),
+            make("small", 3, 20, ".90", "HK"),
+            make("short", 10, 7, "3.10"),
+            make("large", 50, 20, "16.00", "HK"),
+            make("long", 10, 30, "3.30"),
         ]
-        pool = anchors + [make(f"value-{i}", i, 20, Decimal(i) * Decimal(".27")) for i in range(3, 40)]
+        pool = anchors + [make(f"value-{i}", i, 10, Decimal(i) * Decimal(".21")) for i in range(4, 19)]
         with patch.object(settings, "TOP_PLAN_LIMIT", 10):
             selected = catalogue.best_mainland_plan_ids(pool, Decimal("20"))
             self.assertEqual(len(selected), 10)
             self.assertTrue({p["id"] for p in anchors} <= selected)
             self.assertEqual(selected, catalogue.best_mainland_plan_ids(list(reversed(pool)), Decimal("20")))
-            limited = catalogue.best_mainland_plan_ids(pool, Decimal(".51"))
-            self.assertEqual(limited, {"hk-short", "sg-short"})
+            limited = catalogue.best_mainland_plan_ids(pool, Decimal("1"))
+            self.assertEqual(limited, {"small", "value-4"})
 
-    def test_validity_bonus_only_breaks_close_unit_price_choices(self):
+    def test_unit_price_precedes_total_price_and_validity(self):
         make = self.portfolio_plan
         cheap = make("cheap", 1, 10, "1.00", "HK")
         longer = make("longer", 1, 29, "1.02", "HK")
         with patch.object(settings, "TOP_PLAN_LIMIT", 1):
-            self.assertEqual(catalogue.best_mainland_plan_ids([cheap, longer]), {"longer"})
+            self.assertEqual(catalogue.best_mainland_plan_ids([cheap, longer]), {"cheap"})
             costly = make("costly", 1, 29, "1.06", "HK")
             self.assertEqual(catalogue.best_mainland_plan_ids([cheap, costly]), {"cheap"})
+            bulk = make("bulk", 10, 10, "2.00", "HK")
+            self.assertEqual(catalogue.best_mainland_plan_ids([cheap, bulk]), {"bulk"})
+            small = make("small", 3, 10, ".60", "HK")
+            self.assertEqual(catalogue.best_mainland_plan_ids([small, bulk]), {"small"})
+            equal_price_longer = make("equal-price-longer", 3, 20, ".60", "HK")
+            self.assertEqual(catalogue.best_mainland_plan_ids([small, equal_price_longer]), {"equal-price-longer"})
+
+    def test_small_and_short_coverage_survives_a_dominating_bulk_plan(self):
+        small = self.portfolio_plan("small-short", 1, 7, "1.00")
+        bulk = self.portfolio_plan("bulk-long", 50, 30, "1.00")
+        self.assertEqual(catalogue.best_mainland_plan_ids([small, bulk]), {"small-short", "bulk-long"})
+        with patch.object(settings, "TOP_PLAN_LIMIT", 0):
+            self.assertEqual(catalogue.best_mainland_plan_ids([small, bulk]), {"bulk-long"})
 
     def test_explicit_exit_ip_takes_precedence_over_name_marker(self):
         p = self.portfolio_plan("p", 1, 7, ".51", "SG")
@@ -56,7 +70,7 @@ class CatalogueLifecycleTests(unittest.TestCase):
         p["coverage"]["breakout_ip_country_code"] = "HK"
         self.assertEqual(catalogue.plan_route_label(p), "香港")
 
-    def test_small_premium_upgrades_apply_to_all_allowances_and_validities(self):
+    def test_only_no_more_expensive_upgrades_dominate_equivalent_service(self):
         def plan(id, gb, days, price, **fields):
             return dict(
                 id=id,
@@ -71,15 +85,17 @@ class CatalogueLifecycleTests(unittest.TestCase):
             )
 
         short = plan("short", 50, 15, "14.21")
-        long = plan("long", 50, 30, "14.22")
+        long = plan("long", 50, 30, "14.21")
         with patch.object(settings, "TOP_PLAN_LIMIT", 0):
             self.assertEqual(catalogue.best_mainland_plan_ids([short, long]), {"long"})
             # The better package must still be affordable.
-            self.assertEqual(catalogue.best_mainland_plan_ids([short, long], Decimal("14.21")), {"short"})
-            # Apply the same rule to a data upgrade, at the exact 1% boundary.
+            premium = dict(long, price={"currency": "EUR", "amount": "14.22"})
+            self.assertEqual(catalogue.best_mainland_plan_ids([short, premium], Decimal("14.21")), {"short"})
+            self.assertEqual(catalogue.best_mainland_plan_ids([short, premium]), {"short", "long"})
+            # A larger allowance at a higher total price remains a separate choice.
             self.assertEqual(
                 catalogue.best_mainland_plan_ids([plan("small", 3, 30, "1.00"), plan("large", 5, 30, "1.01")]),
-                {"large"},
+                {"small", "large"},
             )
             # Meaningfully different prices and service conditions remain choices.
             self.assertEqual(
@@ -116,7 +132,7 @@ class CatalogueLifecycleTests(unittest.TestCase):
         self.assertEqual(catalogue.best_mainland_plan_ids(plans, Decimal("5.10")), {"20-long"})
         self.assertEqual(catalogue.best_mainland_plan_ids(plans, Decimal("0")), set())
 
-    def test_exact_china_and_distinct_routes(self):
+    def test_china_destinations_share_deduplication_and_keep_distinct_routes(self):
         plan = {
             "id": "hk",
             "name": "China 50GB 30Days",
@@ -128,9 +144,34 @@ class CatalogueLifecycleTests(unittest.TestCase):
             "price": {"currency": "EUR", "amount": "11.23"},
         }
         singapore = dict(plan, id="sg", name="China 50GB 30Days (nonhkip)")
-        mainland = dict(plan, id="mainland", destination="China mainland")
+        mainland = dict(plan, id="mainland", destination="China mainland", price={"currency": "EUR", "amount": "11"})
         duplicate = dict(plan, id="hk-expensive", price={"currency": "EUR", "amount": "15"})
-        self.assertEqual(catalogue.best_mainland_plan_ids([plan, singapore, mainland, duplicate]), {"hk", "sg"})
+        self.assertEqual(catalogue.best_mainland_plan_ids([plan, singapore, mainland, duplicate]), {"mainland", "sg"})
+
+    def test_mainland_roaming_requires_a_china_destination_and_cn_only_coverage(self):
+        for destination in ("China", "China mainland", " CHINA MAINLAND "):
+            for codes in (["CN"], ["CN", "HK"], ["HK"], []):
+                with self.subTest(destination=destination, codes=codes):
+                    self.assertEqual(
+                        catalogue.is_mainland_china_plan({"destination": destination, "coverage": {"codes": codes}}),
+                        codes == ["CN"],
+                    )
+        for destination in ("China (mainland HK Macao)", "Asia", "Hong Kong", "", None):
+            with self.subTest(destination=destination):
+                self.assertFalse(
+                    catalogue.is_mainland_china_plan({"destination": destination, "coverage": {"codes": ["CN"]}})
+                )
+
+    def test_mainland_38gb_plan_participates_in_selection(self):
+        mainland = dict(
+            self.portfolio_plan("mainland-38gb", 38, 20, "10.04", "HK"),
+            name="China mainland 38GB 20Days",
+            destination="China mainland",
+        )
+        china = self.portfolio_plan("china-20gb", 20, 20, "5.81", "HK")
+        with patch.object(settings, "TOP_PLAN_LIMIT", 1):
+            self.assertEqual(catalogue.best_mainland_plan_ids([china, mainland], Decimal("20")), {"mainland-38gb"})
+            self.assertEqual(catalogue.best_mainland_plan_ids([china, mainland], Decimal("10")), {"china-20gb"})
 
     def test_route_label(self):
         self.assertEqual(catalogue.plan_route_label({"name": "China 50GB 30Days (nonhkip)"}), "新加坡")
